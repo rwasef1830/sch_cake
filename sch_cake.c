@@ -69,6 +69,7 @@
 #include <net/pkt_cls.h>
 #include <linux/if_vlan.h>
 #include <net/tcp.h>
+#include <net/ipv6.h>
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
 #include <net/flow_keys.h>
 #else
@@ -76,11 +77,9 @@
 #endif
 #include "cobalt_compat.h"
 
-#if IS_REACHABLE(CONFIG_NF_CONNTRACK)
 #include <net/netfilter/nf_conntrack_core.h>
 #include <net/netfilter/nf_conntrack_zones.h>
 #include <net/netfilter/nf_conntrack.h>
-#endif
 
 #define CAKE_SET_WAYS (8)
 #define CAKE_MAX_TINS (8)
@@ -264,6 +263,9 @@ struct cake_sched_data {
 	u16		max_adjlen;
 	u16		min_netlen;
 	u16		min_adjlen;
+
+	/* Qdisc in early kernels doesn't have limit */
+	u32		limit;
 };
 
 enum {
@@ -514,7 +516,7 @@ static __be16 cake_skb_proto(const struct sk_buff *skb)
 	__be16 proto = skb->protocol;
 	struct vlan_hdr vhdr, *vh;
 
-	while (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
+	while (proto == htons(ETH_P_8021Q)) {
 		vh = skb_header_pointer(skb, offset, sizeof(vhdr), &vhdr);
 		if (!vh)
 			break;
@@ -545,7 +547,7 @@ static int cake_set_ce(struct sk_buff *skb)
 		    skb_try_make_writable(skb, wlen))
 			return 0;
 
-		return IP6_ECN_set_ce(skb, ipv6_hdr(skb));
+		return IP6_ECN_set_ce(ipv6_hdr(skb));
 
 	default:
 		return 0;
@@ -641,8 +643,6 @@ static bool cobalt_should_drop(struct cobalt_vars *vars,
 	return drop;
 }
 
-#if IS_REACHABLE(CONFIG_NF_CONNTRACK)
-
 static void cake_update_flowkeys(struct flow_keys *keys,
 				 const struct sk_buff *skb)
 {
@@ -710,13 +710,6 @@ static void cake_update_flowkeys(struct flow_keys *keys,
 	if (rev)
 		nf_ct_put(ct);
 }
-#else
-static void cake_update_flowkeys(struct flow_keys *keys,
-				 const struct sk_buff *skb)
-{
-	/* There is nothing we can do here without CONNTRACK */
-}
-#endif
 
 /* Cake has several subtle multiple bit settings. In these cases you
  *  would be matching triple isolate mode as well.
@@ -1235,7 +1228,6 @@ static bool cake_tcph_may_drop(const struct tcphdr *tcph,
 		case TCPOPT_WINDOW:
 		case TCPOPT_SACK_PERM:
 		case TCPOPT_FASTOPEN:
-		case TCPOPT_EXP:
 		default: /* don't drop if any unknown options are present */
 			return false;
 		}
@@ -1857,7 +1849,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
 
 	if (skb_is_gso(skb) && q->rate_flags & CAKE_FLAG_SPLIT_GSO) {
 		struct sk_buff *segs, *nskb;
-		netdev_features_t features = netif_skb_features(skb);
+		u64 features = skb->dev->features;
 		unsigned int slen = 0, numsegs = 0;
 
 		segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
@@ -2366,7 +2358,7 @@ static const struct nla_policy cake_policy[TCA_CAKE_MAX + 1] = {
 	[TCA_CAKE_DIFFSERV_MODE] = { .type = NLA_U32 },
 	[TCA_CAKE_ATM]		 = { .type = NLA_U32 },
 	[TCA_CAKE_FLOW_MODE]     = { .type = NLA_U32 },
-	[TCA_CAKE_OVERHEAD]      = { .type = NLA_S32 },
+	[TCA_CAKE_OVERHEAD]      = { .type = NLA_U32 },
 	[TCA_CAKE_RTT]		 = { .type = NLA_U32 },
 	[TCA_CAKE_TARGET]	 = { .type = NLA_U32 },
 	[TCA_CAKE_AUTORATE]      = { .type = NLA_U32 },
@@ -2689,7 +2681,7 @@ static void cake_reconfigure(struct Qdisc *sch)
 	sch->flags &= ~TCQ_F_CAN_BYPASS;
 
 	q->buffer_limit = min(q->buffer_limit,
-			      max(sch->limit * psched_mtu(qdisc_dev(sch)),
+			      max(q->limit * psched_mtu(qdisc_dev(sch)),
 				  q->buffer_config_limit));
 }
 
@@ -2718,17 +2710,9 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
 		return err;
 
 	if (tb[TCA_CAKE_NAT]) {
-#if IS_REACHABLE(CONFIG_NF_CONNTRACK)
 		q->flow_mode &= ~CAKE_FLOW_NAT_FLAG;
 		q->flow_mode |= CAKE_FLOW_NAT_FLAG *
 			!!nla_get_u32(tb[TCA_CAKE_NAT]);
-#else
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 16, 0)
-		NL_SET_ERR_MSG_ATTR(extack, tb[TCA_CAKE_NAT],
-				    "No conntrack support in kernel");
-#endif
-		return -EOPNOTSUPP;
-#endif
 	}
 
 	if (tb[TCA_CAKE_BASE_RATE64])
@@ -2753,7 +2737,7 @@ static int cake_change(struct Qdisc *sch, struct nlattr *opt,
 		q->atm_mode = nla_get_u32(tb[TCA_CAKE_ATM]);
 
 	if (tb[TCA_CAKE_OVERHEAD]) {
-		q->rate_overhead = nla_get_s32(tb[TCA_CAKE_OVERHEAD]);
+		q->rate_overhead = (s32)nla_get_u32(tb[TCA_CAKE_OVERHEAD]);
 		q->rate_flags |= CAKE_FLAG_OVERHEAD;
 
 		q->max_netlen = 0;
@@ -2852,7 +2836,7 @@ static int cake_init(struct Qdisc *sch, struct nlattr *opt,
 	struct cake_sched_data *q = qdisc_priv(sch);
 	int i, j, err;
 
-	sch->limit = 10240;
+	q->limit = 10240;
 	q->tin_mode = CAKE_DIFFSERV_DIFFSERV3;
 	q->flow_mode  = CAKE_FLOW_TRIPLE;
 
@@ -3206,18 +3190,18 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
 			goto nla_put_failure;			       \
 	} while (0)
 
-		PUT_STAT_S32(DEFICIT, flow->deficit);
+		PUT_STAT_U32(DEFICIT, flow->deficit);
 		PUT_STAT_U32(DROPPING, flow->cvars.dropping);
 		PUT_STAT_U32(COBALT_COUNT, flow->cvars.count);
 		PUT_STAT_U32(P_DROP, flow->cvars.p_drop);
 		if (flow->cvars.p_drop) {
-			PUT_STAT_S32(BLUE_TIMER_US,
+			PUT_STAT_U32(BLUE_TIMER_US,
 				     ktime_to_us(
 					     ktime_sub(now,
 						       flow->cvars.blue_timer)));
 		}
 		if (flow->cvars.dropping) {
-			PUT_STAT_S32(DROP_NEXT_US,
+			PUT_STAT_U32(DROP_NEXT_US,
 				     ktime_to_us(
 					     ktime_sub(now,
 						       flow->cvars.drop_next)));
